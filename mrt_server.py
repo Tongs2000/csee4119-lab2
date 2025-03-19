@@ -11,13 +11,12 @@ import queue
 #
 # Server
 #
-
-
 class Connection:
     def __init__(self, client_addr):
-        self.client_addr = client_addr 
+        self.client_addr = client_addr
         self.expected_seq = 0
         self.buffer = b""
+
 class Server:
     def init(self, src_port, receive_buffer_size):
         """
@@ -31,8 +30,8 @@ class Server:
         self.receive_buffer_size = receive_buffer_size
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("", src_port))
-        self.client_conn = None
-        
+        self.client_conn = None  # Will hold the Connection instance once a client connects
+        # Open log file for recording behaviors (log_<port>.txt)
         self.log = open(f"log_{src_port}.txt", "w")
         self.running = True
         self.segment_queue = queue.Queue()
@@ -45,28 +44,36 @@ class Server:
         self.sgmnt_thread.start()
 
     def log_event(self, time_str, src_port, dst_port, seq, ack, seg_type, payload_length):
+        # Log format: <time> <src_port> <dst_port> <seq> <ack> <type> <payload_length>
         line = f"{time_str} {src_port} {dst_port} {seq} {ack} {seg_type} {payload_length}\n"
         self.log.write(line)
         self.log.flush()
 
     def current_time(self):
+        # Return current UTC time in the required format (YYYY-MM-DD HH:MM:SS.mmm)
         t = time.gmtime()
         ms = int((time.time() % 1) * 1000)
         return time.strftime("%Y-%m-%d %H:%M:%S", t) + f".{ms:03d}"
 
     def create_segment(self, seq, ack, seg_type, payload):
-        header = f"{seq}|{ack}|{seg_type}|".encode()
+        # Create a segment in the format: seq|ack|type|checksum|payload
+        checksum = sum(payload) % 256
+        header = f"{seq}|{ack}|{seg_type}|{checksum}|".encode()
         return header + payload
 
     def parse_segment(self, data):
+        # Parse a segment formatted as: seq|ack|type|checksum|payload
         try:
-            parts = data.split(b'|', 3)
+            parts = data.split(b'|', 4)
             seq = int(parts[0].decode())
             ack = int(parts[1].decode())
             seg_type = parts[2].decode()
+            checksum = int(parts[3].decode())
             payload = b""
-            if len(parts) == 4:
-                payload = parts[3]
+            if len(parts) == 5:
+                payload = parts[4]
+            if checksum != (sum(payload) % 256):
+                return None
             return {"seq": seq, "ack": ack, "type": seg_type, "payload": payload}
         except Exception:
             return None
@@ -75,9 +82,9 @@ class Server:
         while self.running:
             try:
                 data, addr = self.sock.recvfrom(4096)
-                self.segment_queue.put((data, addr))
             except:
-                pass
+                continue
+            self.segment_queue.put((data, addr))
 
     def sgmnt_handler(self):
         while self.running:
@@ -92,7 +99,7 @@ class Server:
                 if segment["type"] == "SYN":
                     self.log_event(self.current_time(), self.src_port, addr[1], segment["seq"], segment["ack"], segment["type"], len(segment["payload"]))
                     conn = Connection(addr)
-                    conn.expected_seq = segment["seq"] + 1 
+                    conn.expected_seq = segment["seq"] + 1  # Assuming SYN occupies one sequence number
                     self.client_conn = conn
                     syn_ack = self.create_segment(0, conn.expected_seq, "SYN-ACK", b"")
                     self.sock.sendto(syn_ack, addr)
@@ -158,9 +165,10 @@ class Server:
         return:
         data -- the bytes received from the client, guaranteed to be in its original order
         """
+        data_buffer = b""
         with self.data_cond:
             while len(conn.buffer) < length:
-                self.data_cond.wait()
+                self.data_cond.wait(timeout=1.0)
             data = conn.buffer[:length]
             conn.buffer = conn.buffer[length:]
             return data
@@ -170,10 +178,12 @@ class Server:
         close the server and the client if it is still connected
         blocking until the connection is closed
         """
-        while self.running:
+        start_time = time.time()
+        while self.running and time.time() - start_time < 10:
             time.sleep(0.1)
-        self.rcv_thread.join()
-        self.sgmnt_thread.join()
+        self.running = False
+        self.rcv_thread.join(timeout=2)
+        self.sgmnt_thread.join(timeout=2)
         self.sock.close()
         self.log_event(self.current_time(), self.src_port, "-", 0, 0, "CLOSE", 0)
         self.log.close()

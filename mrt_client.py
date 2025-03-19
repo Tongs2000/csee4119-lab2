@@ -26,7 +26,7 @@ class Client:
         self.segment_size = segment_size
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("", src_port))
-        self.sock.settimeout(1.0)
+        self.sock.settimeout(0.5)
         self.log = open(f"log_{src_port}.txt", "w")
         self.seq = random.randint(0, 1000)
         self.ack = 0
@@ -40,28 +40,36 @@ class Client:
         self.rcv_thread.start()
 
     def current_time(self):
+        # Return current UTC time in the format: YYYY-MM-DD HH:MM:SS.mmm
         t = time.gmtime()
         ms = int((time.time() % 1) * 1000)
         return time.strftime("%Y-%m-%d %H:%M:%S", t) + f".{ms:03d}"
 
     def log_event(self, time_str, src_port, dst_port, seq, ack, seg_type, payload_length):
+        # Log format: <time> <src_port> <dst_port> <seq> <ack> <type> <payload_length>
         line = f"{time_str} {src_port} {dst_port} {seq} {ack} {seg_type} {payload_length}\n"
         self.log.write(line)
         self.log.flush()
 
     def create_segment(self, seq, ack, seg_type, payload):
-        header = f"{seq}|{ack}|{seg_type}|".encode()
+        # Create a segment in the format: seq|ack|type|checksum|payload
+        checksum = sum(payload) % 256
+        header = f"{seq}|{ack}|{seg_type}|{checksum}|".encode()
         return header + payload
 
     def parse_segment(self, data):
+        # Parse a segment formatted as: seq|ack|type|checksum|payload
         try:
-            parts = data.split(b'|', 3)
+            parts = data.split(b'|', 4)
             seq = int(parts[0].decode())
             ack = int(parts[1].decode())
             seg_type = parts[2].decode()
+            checksum = int(parts[3].decode())
             payload = b""
-            if len(parts) == 4:
-                payload = parts[3]
+            if len(parts) == 5:
+                payload = parts[4]
+            if checksum != (sum(payload) % 256):
+                return None
             return {"seq": seq, "ack": ack, "type": seg_type, "payload": payload}
         except Exception:
             return None
@@ -110,6 +118,7 @@ class Client:
         ack_segment = self.create_segment(self.seq, self.ack, "ACK", b"")
         self.sock.sendto(ack_segment, (self.dst_addr, self.dst_port))
         self.log_event(self.current_time(), self.src_port, self.dst_port, self.seq, self.ack, "ACK", 0)
+        base_seq = self.seq
         self.seq += 1
         self.connected = True
 
@@ -125,28 +134,59 @@ class Client:
         """
         if not self.connected:
             return 0
-        total_sent = 0
+        window_size = 4
         sample_header = f"{self.seq}|{self.ack}|PSH|".encode()
-        header_len = len(sample_header)
+        header_len = len(sample_header) + len(str(0)) + 1
         max_payload = self.segment_size - header_len
-        segments = [data[i:i+max_payload] for i in range(0, len(data), max_payload)]
-        for payload in segments:
-            segment = self.create_segment(self.seq, self.ack, "PSH", payload)
-            sent = False
-            while not sent:
+        segments = []
+        seq_start = self.seq
+        temp_seq = self.seq
+        for i in range(0, len(data), max_payload):
+            payload = data[i:i+max_payload]
+            segments.append((temp_seq, payload))
+            temp_seq += len(payload)
+        total_data_length = temp_seq - seq_start
+        base_index = 0
+        next_index = 0
+        outstanding = {}
+        timeout = 1.0
+        total_sent = 0
+        while base_index < len(segments):
+            while next_index < len(segments) and next_index - base_index < window_size:
+                seg_seq, payload = segments[next_index]
+                segment = self.create_segment(seg_seq, self.ack, "PSH", payload)
                 self.sock.sendto(segment, (self.dst_addr, self.dst_port))
-                self.log_event(self.current_time(), self.src_port, self.dst_port, self.seq, self.ack, "PSH", len(payload))
-                with self.ack_cond:
-                    self.ack_cond.wait(timeout=1.0)
-                    if self.last_ack >= self.seq + len(payload):
-                        self.log_event(self.current_time(), self.src_port, self.dst_port, 0, self.last_ack, "ACK", 0)
-                        self.seq = self.last_ack
-                        total_sent += len(payload)
-                        sent = True
+                self.log_event(self.current_time(), self.src_port, self.dst_port, seg_seq, self.ack, "PSH", len(payload))
+                outstanding[next_index] = (segment, time.time())
+                next_index += 1
+            with self.ack_cond:
+                self.ack_cond.wait(timeout=0.1)
+            with self.ack_cond:
+                new_base = base_index
+                for i in range(base_index, len(segments)):
+                    seg_seq, payload = segments[i]
+                    if self.last_ack >= seg_seq + len(payload):
+                        new_base = i + 1
                     else:
+                        break
+                if new_base > base_index:
+                    for i in range(base_index, new_base):
+                        total_sent += len(segments[i][1])
+                        if i in outstanding:
+                            del outstanding[i]
+                    base_index = new_base
+            if outstanding:
+                oldest_index = min(outstanding.keys())
+                _, send_time = outstanding[oldest_index]
+                if time.time() - send_time > timeout:
+                    for i in range(base_index, next_index):
+                        seg_seq, payload = segments[i]
+                        segment = self.create_segment(seg_seq, self.ack, "PSH", payload)
                         self.sock.sendto(segment, (self.dst_addr, self.dst_port))
-                        self.log_event(self.current_time(), self.src_port, self.dst_port, self.seq, self.ack, "PSH-REXMIT", len(payload))
-            self.ack = self.last_ack
+                        self.log_event(self.current_time(), self.src_port, self.dst_port, seg_seq, self.ack, "PSH-REXMIT", len(payload))
+                        outstanding[i] = (segment, time.time())
+        self.ack = self.last_ack
+        self.seq = seq_start + total_data_length
         return total_sent
 
     def close(self):
@@ -159,7 +199,10 @@ class Client:
         fin_segment = self.create_segment(self.seq, self.ack, "FIN", b"")
         self.sock.sendto(fin_segment, (self.dst_addr, self.dst_port))
         self.log_event(self.current_time(), self.src_port, self.dst_port, self.seq, self.ack, "FIN", 0)
+        start_time = time.time()
         while not self.fin_event.wait(timeout=1.0):
+            if time.time() - start_time > 10:
+                break
             self.sock.sendto(fin_segment, (self.dst_addr, self.dst_port))
             self.log_event(self.current_time(), self.src_port, self.dst_port, self.seq, self.ack, "FIN-REXMIT", 0)
         final_ack = self.create_segment(self.seq, self.last_ack + 1, "ACK", b"")
