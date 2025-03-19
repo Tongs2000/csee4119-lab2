@@ -205,7 +205,12 @@ class Client:
                 break
             self.sock.sendto(fin_segment, (self.dst_addr, self.dst_port))
             self.log_event(self.current_time(), self.src_port, self.dst_port, self.seq, self.ack, "FIN-REXMIT", 0)
+        self.seq += 1
         final_ack = self.create_segment(self.seq, self.last_ack + 1, "ACK", b"")
+        for _ in range(3):
+            self.sock.sendto(final_ack, (self.dst_addr, self.dst_port))
+            self.log_event(self.current_time(), self.src_port, self.dst_port, self.seq, self.last_ack + 1, "ACK", 0)
+            time.sleep(0.5)
         self.sock.sendto(final_ack, (self.dst_addr, self.dst_port))
         self.log_event(self.current_time(), self.src_port, self.dst_port, self.seq, self.last_ack + 1, "ACK", 0)
         self.connected = False

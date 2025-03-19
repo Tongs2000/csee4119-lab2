@@ -133,6 +133,21 @@ class Server:
                     self.sock.sendto(fin_seg, addr)
                     self.log_event(self.current_time(), self.src_port, addr[1], 0, 0, "FIN", 0)
                     self.running = False
+                    end_time = time.time() + 5
+                    ack_received = False
+                    while time.time() < end_time:
+                        try:
+                            self.sock.settimeout(0.5)
+                            data, addr_final = self.sock.recvfrom(4096)
+                            segment_final = self.parse_segment(data)
+                            if segment_final and segment_final["type"] == "ACK":
+                                self.log_event(self.current_time(), self.src_port, addr_final[1], segment_final["seq"], segment_final["ack"], segment_final["type"], len(segment_final["payload"]))
+                                ack_received = True
+                                break
+                        except socket.timeout:
+                            continue
+                    if not ack_received:
+                        self.log_event(self.current_time(), self.src_port, addr[1], 0, 0, "TIMEOUT_ACK", 0)
                     self.client_conn = None
 
     def accept(self):
